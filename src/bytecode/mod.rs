@@ -63,6 +63,8 @@ pub enum ReceiverLocation {
 pub struct ProgramBytecode {
     /// Information on public functions, callable from outside the program.
     pub public_functions: BTreeMap<String, PublicFunction>,
+    /// Information on public channels, called from outside the program
+    pub channels: BTreeMap<String, PublicChannel>,
     /// The bytecode instruction stream of the program.
     pub instructions: Vec<Instruction>,
 }
@@ -79,4 +81,21 @@ pub struct PublicFunction {
     pub address: u32,
     /// The number of arguments of the function.
     pub arguments: u16,
+}
+
+#[derive(Clone, Debug, Hash)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "bitcode", derive(bitcode::Encode, bitcode::Decode))]
+#[allow(unused)]
+#[non_exhaustive]
+pub struct PublicChannel {
+    /// The number of inputs the channel requires.
+    pub inputs: u16,
+    /// The address of the compute block.
+    pub compute_address: u32,
+    /// The address of the default expression, if present.
+    pub default_address: Option<u32>,
+    /// The address of the when condition, if present.
+    pub when_address: Option<u32>,
 }

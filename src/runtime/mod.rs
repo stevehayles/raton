@@ -307,7 +307,98 @@ impl<'code, 'func, 'data> VirtualMachine<'code, 'func, 'data> {
         }
 
         self.call_stack.clear();
-        let mut pc = func.address;
+        self.execute_from_address(func.address)
+    }
+
+    /// Evaluate a channel with the given input values.
+    ///
+    /// This is the entry point for the host/runtime to compute channel values
+    /// when their inputs change in the reactive dataflow system.
+    pub fn evaluate_channel(
+        &mut self,
+        channel_name: &str,
+        inputs: &mut [RuntimeValue<'data>],
+    ) -> Result<RuntimeValue<'data>, RuntimeError> {
+        // Extract channel info without holding a reference
+        let (input_count, when_address, compute_address, default_address) = {
+            let channel = self.program.channels.get(channel_name).ok_or_else(|| {
+                RuntimeError::UndefinedFunction {
+                    name: channel_name.to_owned(),
+                }
+            })?;
+
+            (
+                channel.inputs,
+                channel.when_address,
+                channel.compute_address,
+                channel.default_address,
+            )
+        };
+
+        if inputs.len() != input_count as usize {
+            return Err(RuntimeError::WrongNumberOfArguments {
+                expected: input_count,
+                actual: inputs.len() as u16,
+            });
+        }
+
+        // Check when condition if present
+        if let Some(when_addr) = when_address {
+            self.stack.clear();
+            self.stack.reserve(inputs.len());
+            for input in inputs.iter_mut() {
+                self.stack.push(input.clone_or_take());
+            }
+            self.call_stack.clear();
+
+            let condition = self.execute_from_address(when_addr)?;
+
+            if !condition.as_bool()? {
+                // when = false, try default
+                if let Some(default_addr) = default_address {
+                    self.stack.clear();
+                    self.stack.reserve(inputs.len());
+                    for input in inputs.iter_mut() {
+                        self.stack.push(input.clone_or_take());
+                    }
+                    self.call_stack.clear();
+                    return self.execute_from_address(default_addr);
+                }
+                return Err(RuntimeError::UndefinedFunction {
+                    name: format!("{} (when condition false, no default)", channel_name),
+                });
+            }
+        }
+
+        // Execute compute block
+        self.stack.clear();
+        self.stack.reserve(inputs.len());
+        for input in inputs {
+            self.stack.push(input.clone_or_take());
+        }
+        self.call_stack.clear();
+
+        match self.execute_from_address(compute_address) {
+            Ok(v) => Ok(v),
+            Err(_) if default_address.is_some() => {
+                // On compute error, inputs are consumed - would need to save them
+                // to retry with default. For now, return error.
+                Err(RuntimeError::UndefinedFunction {
+                    name: format!("{} (compute failed, cannot retry default)", channel_name),
+                })
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Execute bytecode starting from a specific address.
+    /// The stack should already be populated with any necessary values before calling.
+    /// The call_stack should be clear or set up appropriately.
+    fn execute_from_address(
+        &mut self,
+        start_address: u32,
+    ) -> Result<RuntimeValue<'data>, RuntimeError> {
+        let mut pc = start_address;
         let mut instruction_budget = self.max_instructions;
 
         while let Some(instruction) = self.program.instructions.get(pc as usize) {
@@ -380,8 +471,6 @@ impl<'code, 'func, 'data> VirtualMachine<'code, 'func, 'data> {
                             )),
                             #[cfg(feature = "f32_type")]
                             RuntimeValue::Value(Value::F32(f)) => {
-                                // Omit `f32::NAN` check because this never produces
-                                // a new `f32::NAN`.
                                 RuntimeValue::Value(Value::F32(-f))
                             }
                             _ => {
@@ -658,7 +747,6 @@ impl<'code, 'func, 'data> VirtualMachine<'code, 'func, 'data> {
                         } else {
                             args.first().map(|a| a.receiver_type_id_extern_type())
                         };
-                    // Circumvent lifetime requirements using `raw_entry_mut` API.
                     let key = (receiver_type_id_extern_type, Cow::Borrowed(name.as_str()));
                     fn compute_hash<K: std::hash::Hash + ?Sized, S: std::hash::BuildHasher>(
                         hash_builder: &S,

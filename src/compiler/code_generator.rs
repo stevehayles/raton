@@ -5,6 +5,7 @@ use thiserror::Error;
 /// Turns an abstract syntax tree into bytecode.
 pub struct CodeGenerator {
     public_functions: BTreeMap<Identifier, PublicFunction>,
+    channels: BTreeMap<Identifier, PublicChannel>,
     instructions: Vec<Instruction>,
     variable_stack: Vec<Vec<String>>,
     variable_count: u16,
@@ -52,6 +53,7 @@ impl CodeGenerator {
             #[cfg(feature = "while_loop")]
             loop_stack: Vec::new(),
             public_functions: Default::default(),
+            channels: Default::default(),
             max_instructions: 1_000_000,
             max_depth: 50,
             max_local_variables: 100,
@@ -411,10 +413,99 @@ impl CodeGenerator {
         Ok(())
     }
 
+    fn generate_compute_block(&mut self, block: &ComputeBlock) -> Result<(), CompileError> {
+        if self.variable_stack.len() >= self.max_depth as usize {
+            return Err(CompileError::MaxDepthExceeded);
+        }
+        self.variable_stack.push(Vec::new());
+
+        for stmt in &block.statements {
+            self.generate_stmt(stmt)?;
+        }
+
+        // ComputeBlock always has a value (required)
+        self.generate_expr(&block.value)?;
+
+        self.variable_stack.pop().ok_or(CompileError::Internal)?;
+        Ok(())
+    }
+
+    fn generate_channel(&mut self, channel: &Channel) -> Result<(), CompileError> {
+        if self.public_functions.contains_key(&channel.identifier) {
+            return Err(CompileError::Shadowing {
+                name: channel.identifier.clone(),
+            });
+        }
+        if channel.inputs.len() > self.max_local_variables as usize {
+            return Err(CompileError::MaxLocalVariablesExceeded);
+        }
+
+        // Generate compute block
+        self.variable_count = 0;
+        let compute_ip = self.emit(Instruction::AllocVariables(0))?;
+
+        self.variable_stack.clear();
+        self.variable_stack.push(channel.inputs.clone());
+        self.generate_compute_block(&channel.compute)?;
+        if !matches!(self.instructions.last(), Some(Instruction::Return)) {
+            self.emit(Instruction::Return)?;
+        }
+        self.instructions[compute_ip as usize] = Instruction::AllocVariables(self.variable_count);
+
+        // Generate default if present
+        let default_address = if let Some(ref expr) = channel.default {
+            self.variable_count = 0;
+            let default_ip = self.emit(Instruction::AllocVariables(0))?;
+
+            self.variable_stack.clear();
+            self.variable_stack.push(channel.inputs.clone());
+            self.generate_expr(expr)?;
+            self.emit(Instruction::Return)?;
+
+            self.instructions[default_ip as usize] =
+                Instruction::AllocVariables(self.variable_count);
+            Some(default_ip)
+        } else {
+            None
+        };
+
+        // Generate when if present
+        let when_address = if let Some(ref expr) = channel.when {
+            self.variable_count = 0;
+            let when_ip = self.emit(Instruction::AllocVariables(0))?;
+
+            self.variable_stack.clear();
+            self.variable_stack.push(channel.inputs.clone());
+            self.generate_expr(expr)?;
+            self.emit(Instruction::Return)?;
+
+            self.instructions[when_ip as usize] = Instruction::AllocVariables(self.variable_count);
+            Some(when_ip)
+        } else {
+            None
+        };
+
+        // Insert the channel into the map (channels field should be added to CodeGenerator)
+        self.channels.insert(
+            channel.identifier.clone(),
+            PublicChannel {
+                inputs: channel.inputs.len() as u16,
+                compute_address: compute_ip,
+                default_address,
+                when_address,
+            },
+        );
+
+        Ok(())
+    }
+
     /// Generate bytecode from a program abstract-syntax-tree.
     pub fn generate_program(mut self, program: &Program) -> Result<ProgramBytecode, CompileError> {
         for function in &program.functions {
             self.generate_function(function)?;
+        }
+        for channel in &program.channels {
+            self.generate_channel(channel)?;
         }
         for instruction in &mut self.instructions {
             if let Instruction::CallByName(ReceiverLocation::None, name, args) = instruction {
@@ -429,6 +520,7 @@ impl CodeGenerator {
 
         Ok(ProgramBytecode {
             public_functions: self.public_functions,
+            channels: self.channels,
             instructions: self.instructions,
         })
     }

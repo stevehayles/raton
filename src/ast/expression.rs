@@ -127,7 +127,6 @@ pub struct BlockExpression {
 /// A sequence of statements, followed by a required expression,
 /// in curly brackets.
 ///
-/// `{ stmt1; stmt2; }`
 /// `{ stmt1; stmt2; value }`
 pub struct ComputeBlock {
     /// Statements to execute sequentially
