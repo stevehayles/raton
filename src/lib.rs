@@ -1,4 +1,4 @@
-#![cfg_attr(test, feature(test))]
+//#![cfg_attr(test, feature(test))]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 

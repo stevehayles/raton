@@ -119,3 +119,19 @@ pub struct BlockExpression {
     /// Expression to evaluate to produce a value, the value of the block.
     pub value: Option<Box<Expression>>,
 }
+
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
+/// A sequence of statements, followed by a required expression,
+/// in curly brackets.
+///
+/// `{ stmt1; stmt2; }`
+/// `{ stmt1; stmt2; value }`
+pub struct ComputeBlock {
+    /// Statements to execute sequentially
+    pub statements: Vec<Statement>,
+    /// Expression that produces the final value (required)
+    pub value: Box<Expression>,
+}

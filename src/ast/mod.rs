@@ -24,6 +24,23 @@ pub struct Function {
     pub body: BlockExpression,
 }
 
+/// A channel declaration in the program
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Channel {
+    /// The name that can be used to reference the channel.
+    pub identifier: Identifier,
+    /// The identifiers of the required input channels
+    pub inputs: Vec<Identifier>,
+    /// The computation block ending in a required expression
+    pub compute: ComputeBlock,
+    /// An option default value in the event of a failed computation
+    pub default: Option<Expression>,
+    /// A conditional check of when to calculate the output
+    pub when: Option<Expression>,
+}
+
 /// A abstract syntax tree representing a program.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
@@ -32,4 +49,6 @@ pub struct Function {
 pub struct Program {
     /// Functions defined in the program.
     pub functions: Vec<Function>,
+    /// Channels defined in the program
+    pub channels: Vec<Channel>,
 }

@@ -216,7 +216,8 @@ fn parse_identifier<
 
     // Check for keywords
     match ident {
-        "let" | "if" | "else" | "while" | "break" | "continue" | "return" | "fn" | "null" => err(),
+        "let" | "if" | "else" | "while" | "break" | "continue" | "return" | "fn" | "null"
+        | "channel" | "inputs" | "compute" | "default" | "when" => err(),
         #[cfg(feature = "bool_type")]
         "true" | "false" => err(),
         _ => Ok((i, ident.to_owned())),
@@ -727,14 +728,233 @@ fn parse_function<
     ))
 }
 
+/// Channel parsing
+fn parse_identifier_list<
+    'a,
+    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+>(
+    i: &'a str,
+) -> IResult<&'a str, Vec<String>, E> {
+    delimited(
+        ws(char('[')),
+        separated_list0(ws(char(',')), parse_identifier),
+        ws(cut(char(']'))),
+    )
+    .parse(i)
+}
+
+fn parse_channel_inputs<
+    'a,
+    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+>(
+    i: &'a str,
+) -> IResult<&'a str, Vec<String>, E> {
+    let (i, _) = ws(keyword("inputs")).parse(i)?;
+    let (i, _) = ws(cut(char(':'))).parse(i)?;
+    let (i, inputs) = cut(parse_identifier_list).parse(i)?;
+    Ok((i, inputs))
+}
+
+fn parse_compute_block<
+    'a,
+    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+>(
+    i: &'a str,
+) -> IResult<&'a str, ComputeBlock, E> {
+    let (mut i, _) = ws(char('{')).parse(i)?;
+
+    let mut statements = Vec::new();
+
+    // Parse statements until we hit a final expression
+    loop {
+        // Try to parse a statement
+        let (i2, stmt) = opt(alt((
+            parse_let,
+            #[cfg(feature = "while_loop")]
+            parse_while,
+            parse_assign,
+            // Don't allow return/break/continue in compute blocks
+        )))
+        .parse(i)?;
+
+        if let Some(stmt) = stmt {
+            statements.push(stmt);
+            i = i2;
+        } else {
+            break;
+        }
+    }
+
+    // Now we MUST have a final expression (no semicolon)
+    let (i, value) = cut(expression).parse(i)?;
+    let (i, _) = ws(cut(char('}'))).parse(i)?;
+
+    Ok((
+        i,
+        ComputeBlock {
+            statements,
+            value: Box::new(value),
+        },
+    ))
+}
+
+fn parse_channel_compute<
+    'a,
+    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+>(
+    i: &'a str,
+) -> IResult<&'a str, ComputeBlock, E> {
+    let (i, _) = ws(keyword("compute")).parse(i)?;
+    let (i, _) = ws(cut(char(':'))).parse(i)?;
+
+    // Allow either a compute block or wrap a simple expression
+    let (i, compute) = cut(alt((
+        parse_compute_block,
+        map(expression, |expr| ComputeBlock {
+            statements: vec![],
+            value: Box::new(expr),
+        }),
+    )))
+    .parse(i)?;
+
+    Ok((i, compute))
+}
+
+fn parse_channel_default<
+    'a,
+    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+>(
+    i: &'a str,
+) -> IResult<&'a str, Expression, E> {
+    let (i, _) = ws(keyword("default")).parse(i)?;
+    let (i, _) = ws(cut(char(':'))).parse(i)?;
+    let (i, expr) = cut(expression).parse(i)?;
+    Ok((i, expr))
+}
+
+fn parse_channel_when<
+    'a,
+    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+>(
+    i: &'a str,
+) -> IResult<&'a str, Expression, E> {
+    let (i, _) = ws(keyword("when")).parse(i)?;
+    let (i, _) = ws(cut(char(':'))).parse(i)?;
+    let (i, expr) = cut(expression).parse(i)?;
+    Ok((i, expr))
+}
+
+fn parse_channel<
+    'a,
+    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+>(
+    i: &'a str,
+) -> IResult<&'a str, Channel, E> {
+    let (i, _) = ws(keyword("channel")).parse(i)?;
+    let (i, identifier) = cut(parse_identifier).parse(i)?;
+    let (mut i, _) = ws(cut(char('{'))).parse(i)?;
+
+    // Parse channel body - order doesn't matter
+    let mut inputs = None;
+    let mut compute = None;
+    let mut default = None;
+    let mut when = None;
+
+    loop {
+        // Try to parse each field
+        let (i2, field) = opt(alt((
+            map(parse_channel_inputs, |v| ("inputs", v, None, None)),
+            map(parse_channel_compute, |v| {
+                ("compute", vec![], Some(v), None)
+            }),
+            map(parse_channel_default, |v| {
+                ("default", vec![], None, Some(v))
+            }),
+            map(parse_channel_when, |v| ("when", vec![], None, Some(v))),
+        )))
+        .parse(i)?;
+
+        if let Some((field_name, inp, comp, def_or_when)) = field {
+            match field_name {
+                "inputs" => {
+                    if inputs.is_some() {
+                        return Err(nom::Err::Failure(E::from_error_kind(i2, ErrorKind::Verify)));
+                    }
+                    inputs = Some(inp);
+                }
+                "compute" => {
+                    if compute.is_some() {
+                        return Err(nom::Err::Failure(E::from_error_kind(i2, ErrorKind::Verify)));
+                    }
+                    compute = comp;
+                }
+                "default" => {
+                    if default.is_some() {
+                        return Err(nom::Err::Failure(E::from_error_kind(i2, ErrorKind::Verify)));
+                    }
+                    default = def_or_when;
+                }
+                "when" => {
+                    if when.is_some() {
+                        return Err(nom::Err::Failure(E::from_error_kind(i2, ErrorKind::Verify)));
+                    }
+                    when = def_or_when;
+                }
+                _ => unreachable!(),
+            }
+            i = i2;
+        } else {
+            break;
+        }
+    }
+
+    let (i, _) = ws(cut(char('}'))).parse(i)?;
+
+    // Compute is required, inputs defaults to empty
+    let compute =
+        compute.ok_or_else(|| nom::Err::Failure(E::from_error_kind(i, ErrorKind::Verify)))?;
+    let inputs = inputs.unwrap_or_default();
+
+    Ok((
+        i,
+        Channel {
+            identifier,
+            inputs,
+            compute,
+            default,
+            when,
+        },
+    ))
+}
+
 fn parse_program<
     'a,
     E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
 >(
     i: &'a str,
 ) -> Result<Program, nom::Err<E>> {
-    let (i, functions) = many0(parse_function).parse(i)?;
+    let (i, items) = many0(alt((
+        map(parse_function, |f| ("fn", Some(f), None)),
+        map(parse_channel, |c| ("channel", None, Some(c))),
+    )))
+    .parse(i)?;
+
+    let mut functions = Vec::new();
+    let mut channels = Vec::new();
+
+    for (_, func, chan) in items {
+        if let Some(f) = func {
+            functions.push(f);
+        }
+        if let Some(c) = chan {
+            channels.push(c);
+        }
+    }
+
     let (i, _) = blank(i)?;
     let (_, _) = eof(i)?;
-    Ok(Program { functions })
+    Ok(Program {
+        functions,
+        channels,
+    })
 }
