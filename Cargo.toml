@@ -37,3 +37,6 @@ hashbrown = { version = "=0.16.0", features = ["equivalent", "default-hasher", "
 serde = { version = "1", features = ["std", "derive"], default-features = false, optional = true }
 bitcode = { version = "0", features = ["std", "derive"], default-features = false, optional = true }
 arbitrary = { version = "1", features = ["derive"], optional = true }
+nom_locate = "5.0.0"
+nom-supreme = { git="https://github.com/stevehayles/nom-supreme.git" }
+miette = { version = "7.2.0", features = ["fancy"] }

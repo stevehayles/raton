@@ -1,4 +1,5 @@
 use crate::{ast::*, BinaryOperator, UnaryOperator, Value};
+use miette::{Diagnostic, LabeledSpan, MietteDiagnostic, Report, SourceOffset};
 #[allow(unused_imports)]
 use nom::{
     branch::alt,
@@ -10,14 +11,31 @@ use nom::{
     sequence::{delimited, pair, preceded, terminated},
     IResult, Parser as NomParser,
 };
-use nom_language::{
-    error::{convert_error, VerboseError},
-    precedence::{binary_op, precedence, unary_op, Assoc, Operation},
-};
+use nom_language::precedence::{binary_op, precedence, unary_op, Assoc, Operation};
+use nom_locate::LocatedSpan;
+use nom_supreme::{error::ErrorTree, final_parser::final_parser};
 use std::{
     error::Error,
-    fmt::{self, Debug, Display},
+    fmt::{self, Debug},
 };
+
+/// Small parser-local error type that can be boxed and used as the external error.
+#[derive(Debug)]
+struct CustomError;
+
+impl fmt::Display for CustomError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "parser custom error")
+    }
+}
+
+impl Error for CustomError {}
+
+/// Input span with line/column tracking.
+pub type Span<'a> = LocatedSpan<&'a str>;
+
+/// Type alias for the generic base type
+pub type AnyError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Parses source code into an abstract syntax tree.
 #[non_exhaustive]
@@ -52,36 +70,86 @@ impl Parser {
     pub fn parse<'a>(&self, src: &'a str) -> Result<Program, ParseError<'a>> {
         depth_limiter::reset(self.max_depth as u32);
 
-        type E<'a> = nom_language::error::VerboseError<&'a str>;
-        let ret = parse_program::<E>(src);
+        type E<'a> = ErrorTree<Span<'a>>;
+        let span = Span::new(src);
 
-        ret.map_err(|e| ParseError {
-            src,
-            inner: match e {
-                nom::Err::Incomplete(_) => E::from_error_kind(src, ErrorKind::Complete),
-                nom::Err::Error(e) | nom::Err::Failure(e) => e,
-            },
-        })
+        match final_parser(parse_program::<E>)(span) {
+            Ok(program) => Ok(program),
+            Err(inner) => Err(ParseError { src, inner }),
+        }
     }
 }
 
 /// A parse error at the given location in the source code.
-#[derive(Clone, Debug)]
+#[derive(Debug, Diagnostic)]
+#[diagnostic(code(parser::error))]
 #[allow(missing_docs)]
-pub struct ParseError<'a> {
-    src: &'a str,
-    inner: VerboseError<&'a str>,
+pub struct ParseError<'src> {
+    #[source_code]
+    pub src: &'src str,
+
+    pub inner: ErrorTree<Span<'src>>,
 }
 
-impl<'a> Error for ParseError<'a> {}
+impl ParseError<'_> {
+    /// Create a rich `miette::Report` for display.
+    pub fn to_report(&self) -> Report {
+        let span = match &self.inner {
+            ErrorTree::Base { location, .. } => Some(*location),
+            ErrorTree::Stack { base, .. } => match base.as_ref() {
+                ErrorTree::Base { location, .. } => Some(*location),
+                _ => None,
+            },
+            ErrorTree::Alt(errs) => errs.iter().find_map(|e| match e {
+                ErrorTree::Base { location, .. } => Some(*location),
+                _ => None,
+            }),
+        };
 
-impl<'a> Display for ParseError<'a> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&convert_error(self.src, self.inner.clone()))
+        let diag = if let Some(loc) = span {
+            let offset = loc.location_offset();
+            let label = LabeledSpan::at((SourceOffset::from(offset), 1usize), "parse error here");
+            MietteDiagnostic::new(self.to_string())
+                .with_code("parser::error")
+                .with_labels([label])
+        } else {
+            MietteDiagnostic::new(self.to_string()).with_code("parser::error")
+        };
+
+        Report::new(diag).with_source_code(self.src.to_owned())
     }
 }
 
+impl fmt::Display for ParseError<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use nom_supreme::error::ErrorTree;
+
+        match &self.inner {
+            ErrorTree::Base { location, kind } => {
+                write!(f, "Error at {:?}: {:?}", location, kind)
+            }
+            ErrorTree::Stack { base, contexts } => {
+                writeln!(f, "Context stack:")?;
+                for (span, ctx) in contexts {
+                    writeln!(f, "  at {:?}: {}", span, ctx)?;
+                }
+                writeln!(f, "Caused by: {:?}", base)
+            }
+            ErrorTree::Alt(errs) => {
+                writeln!(f, "Alternative parse errors:")?;
+                for e in errs {
+                    writeln!(f, "  - {}", e)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl Error for ParseError<'_> {}
+
 mod depth_limiter {
+    use crate::prelude::{AnyError, Span};
     use nom::error::{ContextError, ErrorKind, FromExternalError, ParseError as NomParseError};
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -99,16 +167,17 @@ mod depth_limiter {
 
     pub fn dive<
         'a,
-        E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+        E: NomParseError<Span<'a>> + ContextError<Span<'a>> + FromExternalError<Span<'a>, AnyError>,
     >(
-        i: &'a str,
+        i: Span<'a>,
     ) -> Result<DepthGuard, nom::Err<E>> {
         DEPTH.with(|depth| {
             let depth = depth.fetch_sub(1, Ordering::Relaxed);
             if depth == 0 {
-                return Err(nom::Err::Failure(E::from_error_kind(
+                return Err(nom::Err::Failure(E::from_external_error(
                     i,
                     ErrorKind::TooLarge,
+                    Box::new(crate::compiler::parser::CustomError),
                 )));
             }
             Ok(DepthGuard {})
@@ -124,14 +193,13 @@ mod depth_limiter {
     }
 }
 
-/// Parse a single comment.
 #[cfg(any(feature = "single_line_comment", feature = "multi_line_comment"))]
 fn comment<
     'a,
-    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+    E: NomParseError<Span<'a>> + ContextError<Span<'a>> + FromExternalError<Span<'a>, AnyError>,
 >(
-    i: &'a str,
-) -> IResult<&'a str, &'a str, E> {
+    i: Span<'a>,
+) -> IResult<Span<'a>, Span<'a>, E> {
     preceded(
         char('/'),
         alt((
@@ -147,25 +215,31 @@ fn comment<
     .parse(i)
 }
 
-/// Parse several comments.
 #[cfg(any(feature = "single_line_comment", feature = "multi_line_comment"))]
 fn comments<
     'a,
-    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+    E: NomParseError<Span<'a>> + ContextError<Span<'a>> + FromExternalError<Span<'a>, AnyError>,
 >(
-    i: &'a str,
-) -> IResult<&'a str, &'a str, E> {
-    recognize(many0(terminated(comment, multispace0))).parse(i)
+    i: Span<'a>,
+) -> IResult<Span<'a>, Span<'a>, E> {
+    recognize(many0(terminated(comment, multispace0::<Span<'a>, E>))).parse(i)
 }
 
 /// In-between token parser (spaces and comments).
-fn blank<'a, E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>>(
-    i: &'a str,
-) -> IResult<&'a str, (), E> {
+fn blank<
+    'a,
+    E: NomParseError<Span<'a>> + ContextError<Span<'a>> + FromExternalError<Span<'a>, AnyError>,
+>(
+    i: Span<'a>,
+) -> IResult<Span<'a>, (), E> {
     #[cfg(any(feature = "single_line_comment", feature = "multi_line_comment"))]
-    return value((), preceded(multispace0, comments)).parse(i);
+    {
+        value((), preceded(multispace0::<Span<'a>, E>, comments)).parse(i)
+    }
     #[cfg(not(any(feature = "single_line_comment", feature = "multi_line_comment")))]
-    return value((), multispace0).parse(i);
+    {
+        value((), multispace0::<Span<'a>, E>).parse(i)
+    }
 }
 
 // Whitespace helper
@@ -173,12 +247,12 @@ fn ws<
     'a,
     F,
     O,
-    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+    E: NomParseError<Span<'a>> + ContextError<Span<'a>> + FromExternalError<Span<'a>, AnyError>,
 >(
     inner: F,
-) -> impl NomParser<&'a str, Output = O, Error = E>
+) -> impl NomParser<Span<'a>, Output = O, Error = E>
 where
-    F: NomParser<&'a str, Output = O, Error = E>,
+    F: NomParser<Span<'a>, Output = O, Error = E>,
 {
     delimited(blank, inner, blank)
 }
@@ -186,12 +260,12 @@ where
 // Keyword that must not be the prefix of an ident.
 fn keyword<
     'a,
-    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+    E: NomParseError<Span<'a>> + ContextError<Span<'a>> + FromExternalError<Span<'a>, AnyError>,
 >(
     k: &'a str,
-) -> impl NomParser<&'a str, Output = &'a str, Error = E> {
+) -> impl NomParser<Span<'a>, Output = Span<'a>, Error = E> {
     terminated(
-        tag(k),
+        tag(k), // needle is &str; input type is Span<'a>
         not(verify(peek(anychar), |&c: &char| {
             c.is_ascii_alphanumeric() || c == '_'
         })),
@@ -200,10 +274,10 @@ fn keyword<
 
 fn parse_identifier<
     'a,
-    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+    E: NomParseError<Span<'a>> + ContextError<Span<'a>> + FromExternalError<Span<'a>, AnyError>,
 >(
-    i: &'a str,
-) -> IResult<&'a str, String, E> {
+    i: Span<'a>,
+) -> IResult<Span<'a>, String, E> {
     let (i, _) = blank(i)?;
     let (i, ident) = recognize((
         alt((alpha1, tag("_"))),
@@ -214,32 +288,35 @@ fn parse_identifier<
 
     let err = || Err(nom::Err::Error(E::from_error_kind(i, ErrorKind::TooLarge)));
 
+    // Extract &str from LocatedSpan for comparison
+    let ident_str = *ident.fragment();
+
     // Check for keywords
-    match ident {
+    match ident_str {
         "let" | "if" | "else" | "while" | "break" | "continue" | "return" | "fn" | "null"
         | "channel" | "inputs" | "compute" | "default" | "when" => err(),
         #[cfg(feature = "bool_type")]
         "true" | "false" => err(),
-        _ => Ok((i, ident.to_owned())),
+        _ => Ok((i, ident_str.to_owned())),
     }
 }
 
 fn parse_null<
     'a,
-    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+    E: NomParseError<Span<'a>> + ContextError<Span<'a>> + FromExternalError<Span<'a>, AnyError>,
 >(
-    i: &'a str,
-) -> IResult<&'a str, Value, E> {
+    i: Span<'a>,
+) -> IResult<Span<'a>, Value, E> {
     value(Value::Null, ws(keyword("null"))).parse(i)
 }
 
 #[cfg(feature = "bool_type")]
 fn parse_bool<
     'a,
-    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+    E: NomParseError<Span<'a>> + ContextError<Span<'a>> + FromExternalError<Span<'a>, AnyError>,
 >(
-    i: &'a str,
-) -> IResult<&'a str, Value, E> {
+    i: Span<'a>,
+) -> IResult<Span<'a>, Value, E> {
     alt((
         value(Value::Bool(true), ws(keyword("true"))),
         value(Value::Bool(false), ws(keyword("false"))),
@@ -250,13 +327,16 @@ fn parse_bool<
 #[cfg(feature = "f32_type")]
 fn parse_f32<
     'a,
-    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+    E: NomParseError<Span<'a>> + ContextError<Span<'a>> + FromExternalError<Span<'a>, AnyError>,
 >(
-    i: &'a str,
-) -> IResult<&'a str, Value, E> {
+    i: Span<'a>,
+) -> IResult<Span<'a>, Value, E> {
     let (i, _) = blank(i)?;
-    let (i, num_str) = recognize((opt(char('-')), digit1, char('.'), digit1)).parse(i)?;
+    let (i, num_span) = recognize((opt(char('-')), digit1, char('.'), digit1)).parse(i)?;
     let (i, _) = blank(i)?;
+
+    // Extract the &str contents of the LocatedSpan
+    let num_str = *num_span.fragment();
 
     match num_str.parse::<f32>() {
         Ok(f) => Ok((i, Value::F32(f))),
@@ -267,13 +347,16 @@ fn parse_f32<
 #[cfg(feature = "i32_type")]
 fn parse_i32<
     'a,
-    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+    E: NomParseError<Span<'a>> + ContextError<Span<'a>> + FromExternalError<Span<'a>, AnyError>,
 >(
-    i: &'a str,
-) -> IResult<&'a str, Value, E> {
+    i: Span<'a>,
+) -> IResult<Span<'a>, Value, E> {
     let (i, _) = blank(i)?;
-    let (i, num_str) = recognize(pair(opt(char('-')), digit1)).parse(i)?;
+    let (i, num_span) = recognize(pair(opt(char('-')), digit1)).parse(i)?;
     let (i, _) = blank(i)?;
+
+    // Extract &str from LocatedSpan
+    let num_str = *num_span.fragment();
 
     match num_str.parse::<i32>() {
         Ok(n) => Ok((i, Value::I32(n))),
@@ -284,10 +367,10 @@ fn parse_i32<
 #[cfg(feature = "string_type")]
 fn parse_string<
     'a,
-    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+    E: NomParseError<Span<'a>> + ContextError<Span<'a>> + FromExternalError<Span<'a>, AnyError>,
 >(
-    i: &'a str,
-) -> IResult<&'a str, Value, E> {
+    i: Span<'a>,
+) -> IResult<Span<'a>, Value, E> {
     let (i, _) = blank.parse(i)?;
     let (i, _) = char('"').parse(i)?;
     let (i, content) = take_while1(|c| c != '"').parse(i)?;
@@ -299,10 +382,10 @@ fn parse_string<
 
 fn parse_literal<
     'a,
-    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+    E: NomParseError<Span<'a>> + ContextError<Span<'a>> + FromExternalError<Span<'a>, AnyError>,
 >(
-    i: &'a str,
-) -> IResult<&'a str, Value, E> {
+    i: Span<'a>,
+) -> IResult<Span<'a>, Value, E> {
     alt((
         parse_null,
         #[cfg(feature = "bool_type")]
@@ -328,10 +411,10 @@ enum PostfixOp {
 #[cfg(feature = "method_call_expression")]
 fn method_call<
     'a,
-    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+    E: NomParseError<Span<'a>> + ContextError<Span<'a>> + FromExternalError<Span<'a>, AnyError>,
 >(
-    i: &'a str,
-) -> IResult<&'a str, PostfixOp, E> {
+    i: Span<'a>,
+) -> IResult<Span<'a>, PostfixOp, E> {
     map(
         preceded(
             char('.'),
@@ -351,10 +434,10 @@ fn method_call<
 
 fn function_call<
     'a,
-    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+    E: NomParseError<Span<'a>> + ContextError<Span<'a>> + FromExternalError<Span<'a>, AnyError>,
 >(
-    i: &'a str,
-) -> IResult<&'a str, PostfixOp, E> {
+    i: Span<'a>,
+) -> IResult<Span<'a>, PostfixOp, E> {
     map(
         delimited(
             ws(char('(')),
@@ -368,10 +451,10 @@ fn function_call<
 
 fn parse_block<
     'a,
-    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+    E: NomParseError<Span<'a>> + ContextError<Span<'a>> + FromExternalError<Span<'a>, AnyError>,
 >(
-    i: &'a str,
-) -> IResult<&'a str, BlockExpression, E> {
+    i: Span<'a>,
+) -> IResult<Span<'a>, BlockExpression, E> {
     let (mut i, _) = ws(char('{')).parse(i)?;
 
     let mut statements = Vec::new();
@@ -414,10 +497,10 @@ fn parse_block<
 #[cfg(feature = "if_expression")]
 fn parse_if<
     'a,
-    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+    E: NomParseError<Span<'a>> + ContextError<Span<'a>> + FromExternalError<Span<'a>, AnyError>,
 >(
-    i: &'a str,
-) -> IResult<&'a str, Expression, E> {
+    i: Span<'a>,
+) -> IResult<Span<'a>, Expression, E> {
     let (i, _) = ws(keyword("if")).parse(i)?;
     let (i, cond) = cut(expression).parse(i)?;
     let (i, then_branch) = cut(parse_block).parse(i)?;
@@ -435,10 +518,10 @@ fn parse_if<
 // Primary expression (atom)
 fn primary_expr<
     'a,
-    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+    E: NomParseError<Span<'a>> + ContextError<Span<'a>> + FromExternalError<Span<'a>, AnyError>,
 >(
-    i: &'a str,
-) -> IResult<&'a str, Expression, E> {
+    i: Span<'a>,
+) -> IResult<Span<'a>, Expression, E> {
     alt((
         map(parse_literal, Expression::Literal),
         #[cfg(feature = "if_expression")]
@@ -453,10 +536,10 @@ fn primary_expr<
 // Main expression parser using precedence
 fn expression<
     'a,
-    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+    E: NomParseError<Span<'a>> + ContextError<Span<'a>> + FromExternalError<Span<'a>, AnyError>,
 >(
-    i: &'a str,
-) -> IResult<&'a str, Expression, E> {
+    i: Span<'a>,
+) -> IResult<Span<'a>, Expression, E> {
     let _guard = depth_limiter::dive(i)?;
 
     precedence(
@@ -523,14 +606,14 @@ fn expression<
             binary_op(8, Assoc::Left, value(BinaryOperator::Or, ws(tag("||")))),
         )),
         primary_expr,
-        |op: Operation<UnaryOperator, PostfixOp, BinaryOperator, Expression>| -> Result<Expression, ()> {
+        |op: Operation<UnaryOperator, PostfixOp, BinaryOperator, Expression>| -> Result<Expression, AnyError> {
             use Operation::*;
             match op {
                 Prefix(operator, operand) => Ok(Expression::Unary(UnaryExpression { operator, operand: Box::new(operand) })),
                 Postfix(Expression::Variable(name), PostfixOp::Call(arguments)) => Ok(Expression::Call(CallExpression{identifier: name, arguments})),
                 #[cfg(feature = "method_call_expression")]
                 Postfix(receiver, PostfixOp::MethodCall(name, arguments)) => Ok(Expression::MethodCall(MethodCallExpression{receiver: Box::new(receiver), identifier: name, arguments})),
-                Postfix(_, PostfixOp::Call(_)) => Err(()),
+                Postfix(_, PostfixOp::Call(_)) => Err(Box::new(CustomError)),
                 Binary(left, operator, right) => Ok(Expression::Binary(BinaryExpression{operator, left: Box::new(left), right: Box::new(right)})),
             }
         },
@@ -539,10 +622,10 @@ fn expression<
 
 fn parse_let<
     'a,
-    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+    E: NomParseError<Span<'a>> + ContextError<Span<'a>> + FromExternalError<Span<'a>, AnyError>,
 >(
-    i: &'a str,
-) -> IResult<&'a str, Statement, E> {
+    i: Span<'a>,
+) -> IResult<Span<'a>, Statement, E> {
     let (i, _) = ws(keyword("let")).parse(i)?;
     let (i, identifier) = cut(parse_identifier).parse(i)?;
     let (i, _) = ws(cut(char('='))).parse(i)?;
@@ -559,10 +642,10 @@ fn parse_let<
 
 fn parse_assign<
     'a,
-    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+    E: NomParseError<Span<'a>> + ContextError<Span<'a>> + FromExternalError<Span<'a>, AnyError>,
 >(
-    i: &'a str,
-) -> IResult<&'a str, Statement, E> {
+    i: Span<'a>,
+) -> IResult<Span<'a>, Statement, E> {
     let (i, identifier) = parse_identifier.parse(i)?;
     let (i, _) = ws(char('=')).parse(i)?;
     let (i, expression) = cut(expression).parse(i)?;
@@ -579,10 +662,10 @@ fn parse_assign<
 #[cfg(feature = "while_loop")]
 fn parse_while<
     'a,
-    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+    E: NomParseError<Span<'a>> + ContextError<Span<'a>> + FromExternalError<Span<'a>, AnyError>,
 >(
-    i: &'a str,
-) -> IResult<&'a str, Statement, E> {
+    i: Span<'a>,
+) -> IResult<Span<'a>, Statement, E> {
     let (i, _) = ws(keyword("while")).parse(i)?;
     let (i, condition) = cut(expression).parse(i)?;
     let (i, _) = ws(cut(char('{'))).parse(i)?;
@@ -598,10 +681,10 @@ fn parse_while<
 #[cfg(feature = "while_loop")]
 fn parse_break<
     'a,
-    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+    E: NomParseError<Span<'a>> + ContextError<Span<'a>> + FromExternalError<Span<'a>, AnyError>,
 >(
-    i: &'a str,
-) -> IResult<&'a str, Statement, E> {
+    i: Span<'a>,
+) -> IResult<Span<'a>, Statement, E> {
     let (i, _) = ws(keyword("break")).parse(i)?;
     let (i, _) = ws(cut(char(';'))).parse(i)?;
     Ok((i, Statement::Break))
@@ -610,10 +693,10 @@ fn parse_break<
 #[cfg(feature = "while_loop")]
 fn parse_continue<
     'a,
-    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+    E: NomParseError<Span<'a>> + ContextError<Span<'a>> + FromExternalError<Span<'a>, AnyError>,
 >(
-    i: &'a str,
-) -> IResult<&'a str, Statement, E> {
+    i: Span<'a>,
+) -> IResult<Span<'a>, Statement, E> {
     let (i, _) = ws(keyword("continue")).parse(i)?;
     let (i, _) = ws(cut(char(';'))).parse(i)?;
     Ok((i, Statement::Continue))
@@ -621,10 +704,10 @@ fn parse_continue<
 
 fn parse_return<
     'a,
-    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+    E: NomParseError<Span<'a>> + ContextError<Span<'a>> + FromExternalError<Span<'a>, AnyError>,
 >(
-    i: &'a str,
-) -> IResult<&'a str, Statement, E> {
+    i: Span<'a>,
+) -> IResult<Span<'a>, Statement, E> {
     let (i, _) = ws(keyword("return")).parse(i)?;
     let (i, value) = opt(expression).parse(i)?;
     let (i, _) = ws(cut(char(';'))).parse(i)?;
@@ -634,10 +717,10 @@ fn parse_return<
 #[cfg(feature = "while_loop")]
 fn parse_expr_stmt<
     'a,
-    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+    E: NomParseError<Span<'a>> + ContextError<Span<'a>> + FromExternalError<Span<'a>, AnyError>,
 >(
-    i: &'a str,
-) -> IResult<&'a str, Statement, E> {
+    i: Span<'a>,
+) -> IResult<Span<'a>, Statement, E> {
     let (i, expr) = expression.parse(i)?;
     let (i, _) = ws(char(';')).parse(i)?;
     Ok((i, Statement::Expression(expr)))
@@ -646,10 +729,10 @@ fn parse_expr_stmt<
 #[cfg(feature = "while_loop")]
 fn parse_stmt<
     'a,
-    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+    E: NomParseError<Span<'a>> + ContextError<Span<'a>> + FromExternalError<Span<'a>, AnyError>,
 >(
-    i: &'a str,
-) -> IResult<&'a str, Statement, E> {
+    i: Span<'a>,
+) -> IResult<Span<'a>, Statement, E> {
     alt((
         parse_let,
         #[cfg(feature = "while_loop")]
@@ -672,10 +755,10 @@ enum StmtOrExpr {
 
 fn parse_stmt_or_expr<
     'a,
-    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+    E: NomParseError<Span<'a>> + ContextError<Span<'a>> + FromExternalError<Span<'a>, AnyError>,
 >(
-    i: &'a str,
-) -> IResult<&'a str, StmtOrExpr, E> {
+    i: Span<'a>,
+) -> IResult<Span<'a>, StmtOrExpr, E> {
     let (i, expr) = opt(expression).parse(i)?;
 
     if let Some(expr) = expr {
@@ -708,10 +791,10 @@ fn parse_stmt_or_expr<
 
 fn parse_function<
     'a,
-    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+    E: NomParseError<Span<'a>> + ContextError<Span<'a>> + FromExternalError<Span<'a>, AnyError>,
 >(
-    i: &'a str,
-) -> IResult<&'a str, Function, E> {
+    i: Span<'a>,
+) -> IResult<Span<'a>, Function, E> {
     let (i, _) = ws(keyword("fn")).parse(i)?;
     let (i, identifier) = cut(parse_identifier).parse(i)?;
     let (i, _) = ws(cut(char('('))).parse(i)?;
@@ -731,10 +814,10 @@ fn parse_function<
 /// Channel parsing
 fn parse_identifier_list<
     'a,
-    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+    E: NomParseError<Span<'a>> + ContextError<Span<'a>> + FromExternalError<Span<'a>, AnyError>,
 >(
-    i: &'a str,
-) -> IResult<&'a str, Vec<String>, E> {
+    i: Span<'a>,
+) -> IResult<Span<'a>, Vec<String>, E> {
     delimited(
         ws(char('[')),
         separated_list0(ws(char(',')), parse_identifier),
@@ -745,10 +828,10 @@ fn parse_identifier_list<
 
 fn parse_channel_inputs<
     'a,
-    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+    E: NomParseError<Span<'a>> + ContextError<Span<'a>> + FromExternalError<Span<'a>, AnyError>,
 >(
-    i: &'a str,
-) -> IResult<&'a str, Vec<String>, E> {
+    i: Span<'a>,
+) -> IResult<Span<'a>, Vec<String>, E> {
     let (i, _) = ws(keyword("inputs")).parse(i)?;
     let (i, _) = ws(cut(char(':'))).parse(i)?;
     let (i, inputs) = cut(parse_identifier_list).parse(i)?;
@@ -757,10 +840,10 @@ fn parse_channel_inputs<
 
 fn parse_compute_block<
     'a,
-    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+    E: NomParseError<Span<'a>> + ContextError<Span<'a>> + FromExternalError<Span<'a>, AnyError>,
 >(
-    i: &'a str,
-) -> IResult<&'a str, ComputeBlock, E> {
+    i: Span<'a>,
+) -> IResult<Span<'a>, ComputeBlock, E> {
     let (mut i, _) = ws(char('{')).parse(i)?;
 
     let mut statements = Vec::new();
@@ -800,10 +883,10 @@ fn parse_compute_block<
 
 fn parse_channel_compute<
     'a,
-    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+    E: NomParseError<Span<'a>> + ContextError<Span<'a>> + FromExternalError<Span<'a>, AnyError>,
 >(
-    i: &'a str,
-) -> IResult<&'a str, ComputeBlock, E> {
+    i: Span<'a>,
+) -> IResult<Span<'a>, ComputeBlock, E> {
     let (i, _) = ws(keyword("compute")).parse(i)?;
     let (i, _) = ws(cut(char(':'))).parse(i)?;
 
@@ -822,10 +905,10 @@ fn parse_channel_compute<
 
 fn parse_channel_default<
     'a,
-    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+    E: NomParseError<Span<'a>> + ContextError<Span<'a>> + FromExternalError<Span<'a>, AnyError>,
 >(
-    i: &'a str,
-) -> IResult<&'a str, Expression, E> {
+    i: Span<'a>,
+) -> IResult<Span<'a>, Expression, E> {
     let (i, _) = ws(keyword("default")).parse(i)?;
     let (i, _) = ws(cut(char(':'))).parse(i)?;
     let (i, expr) = cut(expression).parse(i)?;
@@ -834,10 +917,10 @@ fn parse_channel_default<
 
 fn parse_channel_when<
     'a,
-    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+    E: NomParseError<Span<'a>> + ContextError<Span<'a>> + FromExternalError<Span<'a>, AnyError>,
 >(
-    i: &'a str,
-) -> IResult<&'a str, Expression, E> {
+    i: Span<'a>,
+) -> IResult<Span<'a>, Expression, E> {
     let (i, _) = ws(keyword("when")).parse(i)?;
     let (i, _) = ws(cut(char(':'))).parse(i)?;
     let (i, expr) = cut(expression).parse(i)?;
@@ -846,10 +929,10 @@ fn parse_channel_when<
 
 fn parse_channel<
     'a,
-    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+    E: NomParseError<Span<'a>> + ContextError<Span<'a>> + FromExternalError<Span<'a>, AnyError>,
 >(
-    i: &'a str,
-) -> IResult<&'a str, Channel, E> {
+    i: Span<'a>,
+) -> IResult<Span<'a>, Channel, E> {
     let (i, _) = ws(keyword("channel")).parse(i)?;
     let (i, identifier) = cut(parse_identifier).parse(i)?;
     let (mut i, _) = ws(cut(char('{'))).parse(i)?;
@@ -929,10 +1012,10 @@ fn parse_channel<
 
 fn parse_program<
     'a,
-    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+    E: NomParseError<Span<'a>> + ContextError<Span<'a>> + FromExternalError<Span<'a>, AnyError>,
 >(
-    i: &'a str,
-) -> Result<Program, nom::Err<E>> {
+    i: Span<'a>,
+) -> nom::IResult<Span<'a>, Program, E> {
     let (i, items) = many0(alt((
         map(parse_function, |f| ("fn", Some(f), None)),
         map(parse_channel, |c| ("channel", None, Some(c))),
@@ -952,9 +1035,13 @@ fn parse_program<
     }
 
     let (i, _) = blank(i)?;
-    let (_, _) = eof(i)?;
-    Ok(Program {
-        functions,
-        channels,
-    })
+    let (i, _) = eof(i)?;
+
+    Ok((
+        i,
+        Program {
+            functions,
+            channels,
+        },
+    ))
 }
