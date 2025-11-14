@@ -83,6 +83,7 @@ pub struct PublicFunction {
     pub arguments: u16,
 }
 
+/// Information on a public channel, allowing it to be called.
 #[derive(Clone, Debug, Hash)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]

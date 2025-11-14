@@ -73,9 +73,9 @@ pub struct ParseError<'a> {
     inner: VerboseError<&'a str>,
 }
 
-impl<'a> Error for ParseError<'a> {}
+impl Error for ParseError<'_> {}
 
-impl<'a> Display for ParseError<'a> {
+impl Display for ParseError<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&convert_error(self.src, self.inner.clone()))
     }
@@ -83,17 +83,17 @@ impl<'a> Display for ParseError<'a> {
 
 mod depth_limiter {
     use nom::error::{ContextError, ErrorKind, FromExternalError, ParseError as NomParseError};
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::cell::Cell;
 
     thread_local! {
-        static DEPTH: AtomicU32 = const { AtomicU32::new(0) };
+        static DEPTH: Cell<u32> = const { Cell::new(0) };
     }
     #[must_use]
     pub struct DepthGuard {}
 
     pub fn reset(max: u32) {
         DEPTH.with(|depth| {
-            depth.store(max, Ordering::Relaxed);
+            depth.set(max);
         });
     }
 
@@ -104,21 +104,23 @@ mod depth_limiter {
         i: &'a str,
     ) -> Result<DepthGuard, nom::Err<E>> {
         DEPTH.with(|depth| {
-            let depth = depth.fetch_sub(1, Ordering::Relaxed);
-            if depth == 0 {
-                return Err(nom::Err::Failure(E::from_error_kind(
+            let current = depth.get();
+            if current == 0 {
+                Err(nom::Err::Failure(E::from_error_kind(
                     i,
                     ErrorKind::TooLarge,
-                )));
+                )))
+            } else {
+                depth.set(current - 1);
+                Ok(DepthGuard {})
             }
-            Ok(DepthGuard {})
         })
     }
 
     impl Drop for DepthGuard {
         fn drop(&mut self) {
             DEPTH.with(|depth| {
-                depth.fetch_add(1, Ordering::Relaxed);
+                depth.set(depth.get() + 1);
             })
         }
     }
@@ -729,6 +731,28 @@ fn parse_function<
 }
 
 /// Channel parsing
+enum ChannelField {
+    Inputs(Vec<String>),
+    Compute(ComputeBlock),
+    Default(Expression),
+    When(Expression),
+}
+
+fn parse_channel_field<
+    'a,
+    E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
+>(
+    i: &'a str,
+) -> IResult<&'a str, ChannelField, E> {
+    alt((
+        map(parse_channel_inputs, ChannelField::Inputs),
+        map(parse_channel_compute, ChannelField::Compute),
+        map(parse_channel_default, ChannelField::Default),
+        map(parse_channel_when, ChannelField::When),
+    ))
+    .parse(i)
+}
+
 fn parse_identifier_list<
     'a,
     E: NomParseError<&'a str> + ContextError<&'a str> + FromExternalError<&'a str, ()>,
@@ -861,51 +885,36 @@ fn parse_channel<
     let mut when = None;
 
     loop {
-        // Try to parse each field
-        let (i2, field) = opt(alt((
-            map(parse_channel_inputs, |v| ("inputs", v, None, None)),
-            map(parse_channel_compute, |v| {
-                ("compute", vec![], Some(v), None)
-            }),
-            map(parse_channel_default, |v| {
-                ("default", vec![], None, Some(v))
-            }),
-            map(parse_channel_when, |v| ("when", vec![], None, Some(v))),
-        )))
-        .parse(i)?;
+        let (i2, field) = opt(parse_channel_field).parse(i)?;
 
-        if let Some((field_name, inp, comp, def_or_when)) = field {
-            match field_name {
-                "inputs" => {
-                    if inputs.is_some() {
-                        return Err(nom::Err::Failure(E::from_error_kind(i2, ErrorKind::Verify)));
-                    }
-                    inputs = Some(inp);
+        match field {
+            Some(ChannelField::Inputs(v)) => {
+                if inputs.is_some() {
+                    return Err(nom::Err::Failure(E::from_error_kind(i2, ErrorKind::Verify)));
                 }
-                "compute" => {
-                    if compute.is_some() {
-                        return Err(nom::Err::Failure(E::from_error_kind(i2, ErrorKind::Verify)));
-                    }
-                    compute = comp;
-                }
-                "default" => {
-                    if default.is_some() {
-                        return Err(nom::Err::Failure(E::from_error_kind(i2, ErrorKind::Verify)));
-                    }
-                    default = def_or_when;
-                }
-                "when" => {
-                    if when.is_some() {
-                        return Err(nom::Err::Failure(E::from_error_kind(i2, ErrorKind::Verify)));
-                    }
-                    when = def_or_when;
-                }
-                _ => unreachable!(),
+                inputs = Some(v);
             }
-            i = i2;
-        } else {
-            break;
+            Some(ChannelField::Compute(c)) => {
+                if compute.is_some() {
+                    return Err(nom::Err::Failure(E::from_error_kind(i2, ErrorKind::Verify)));
+                }
+                compute = Some(c);
+            }
+            Some(ChannelField::Default(e)) => {
+                if default.is_some() {
+                    return Err(nom::Err::Failure(E::from_error_kind(i2, ErrorKind::Verify)));
+                }
+                default = Some(e);
+            }
+            Some(ChannelField::When(e)) => {
+                if when.is_some() {
+                    return Err(nom::Err::Failure(E::from_error_kind(i2, ErrorKind::Verify)));
+                }
+                when = Some(e);
+            }
+            None => break,
         }
+        i = i2;
     }
 
     let (i, _) = ws(cut(char('}'))).parse(i)?;

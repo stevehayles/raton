@@ -14,7 +14,7 @@ pub enum RuntimeValue<'a> {
     Extern(Extern<'a>),
 }
 
-impl<'a> RuntimeValue<'a> {
+impl RuntimeValue<'_> {
     /// Gets the [`Type`] of this value.
     pub fn type_of(&self) -> Type {
         match self {
@@ -60,7 +60,7 @@ impl<'a> RuntimeValue<'a> {
     }
 }
 
-impl<'a> Default for RuntimeValue<'a> {
+impl Default for RuntimeValue<'_> {
     fn default() -> Self {
         Self::Value(Default::default())
     }
@@ -78,7 +78,7 @@ pub enum Extern<'a> {
     Mut(&'a mut dyn Any),
 }
 
-impl<'a> Extern<'a> {
+impl Extern<'_> {
     /// Get the [`Type`] of this value.
     pub fn type_of(&self) -> Type {
         match self {
@@ -90,7 +90,7 @@ impl<'a> Extern<'a> {
     }
 }
 
-impl<'a> Debug for Extern<'a> {
+impl Debug for Extern<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             #[cfg(feature = "extern_value_type")]
@@ -105,7 +105,7 @@ impl<'a> Debug for Extern<'a> {
     }
 }
 
-impl<'a, 'b> PartialEq<RuntimeValue<'b>> for RuntimeValue<'a> {
+impl<'b> PartialEq<RuntimeValue<'b>> for RuntimeValue<'_> {
     fn eq(&self, other: &RuntimeValue<'b>) -> bool {
         match (self, other) {
             (Self::Value(v), RuntimeValue::Value(v2)) => v == v2,
@@ -115,7 +115,7 @@ impl<'a, 'b> PartialEq<RuntimeValue<'b>> for RuntimeValue<'a> {
     }
 }
 
-impl<'a, 'b> PartialEq<Extern<'b>> for Extern<'a> {
+impl<'b> PartialEq<Extern<'b>> for Extern<'_> {
     fn eq(&self, other: &Extern<'b>) -> bool {
         match (self, other) {
             #[cfg(feature = "extern_value_type")]

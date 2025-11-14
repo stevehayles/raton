@@ -142,7 +142,7 @@ where
 }
 
 #[cfg(feature = "method_call_expression")]
-impl<'a, 'b> std::ops::Deref for Receiver<'a, 'b, Value> {
+impl std::ops::Deref for Receiver<'_, '_, Value> {
     type Target = Value;
 
     fn deref(&self) -> &Self::Target {
@@ -155,7 +155,7 @@ impl<'a, 'b> std::ops::Deref for Receiver<'a, 'b, Value> {
 }
 
 #[cfg(feature = "method_call_expression")]
-impl<'a, 'b> std::ops::DerefMut for Receiver<'a, 'b, Value> {
+impl std::ops::DerefMut for Receiver<'_, '_, Value> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         match self.borrow {
             RuntimeValue::Value(v) => v,
@@ -166,7 +166,7 @@ impl<'a, 'b> std::ops::DerefMut for Receiver<'a, 'b, Value> {
 }
 
 #[cfg(all(feature = "method_call_expression", feature = "extern_value_type"))]
-impl<'a, 'b, T: 'static> std::ops::Deref for Receiver<'a, 'b, ExternValue<T>> {
+impl<T: 'static> std::ops::Deref for Receiver<'_, '_, ExternValue<T>> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -179,7 +179,7 @@ impl<'a, 'b, T: 'static> std::ops::Deref for Receiver<'a, 'b, ExternValue<T>> {
 }
 
 #[cfg(feature = "method_call_expression")]
-impl<'b, 'a: 'b, 'c, T: 'static> std::ops::Deref for Receiver<'a, 'b, ExternRef<'c, T>> {
+impl<'b, 'a: 'b, T: 'static> std::ops::Deref for Receiver<'a, 'b, ExternRef<'_, T>> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -192,7 +192,7 @@ impl<'b, 'a: 'b, 'c, T: 'static> std::ops::Deref for Receiver<'a, 'b, ExternRef<
 }
 
 #[cfg(feature = "method_call_expression")]
-impl<'b, 'a: 'b, 'c, T: 'static> std::ops::Deref for Receiver<'a, 'b, ExternMut<'c, T>> {
+impl<'b, 'a: 'b, T: 'static> std::ops::Deref for Receiver<'a, 'b, ExternMut<'_, T>> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -205,7 +205,7 @@ impl<'b, 'a: 'b, 'c, T: 'static> std::ops::Deref for Receiver<'a, 'b, ExternMut<
 }
 
 #[cfg(feature = "method_call_expression")]
-impl<'b, 'a: 'b, 'c, T: 'static> std::ops::DerefMut for Receiver<'a, 'b, ExternMut<'c, T>> {
+impl<'b, 'a: 'b, T: 'static> std::ops::DerefMut for Receiver<'a, 'b, ExternMut<'_, T>> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         match self.borrow {
             RuntimeValue::Extern(Extern::Mut(v)) => (**v).downcast_mut().unwrap(),
