@@ -32,7 +32,7 @@ multi_line_comment = []
 [dependencies]
 nom = "=8.0.0"
 nom-language = "=0.1.0"
-thiserror = "=2.0.17"
+thiserror = "=2.0"
 hashbrown = { version = "=0.16.0", features = ["equivalent", "default-hasher", "raw-entry"], default-features = false }
 serde = { version = "1", features = ["std", "derive"], default-features = false, optional = true }
 bitcode = { version = "0", features = ["std", "derive"], default-features = false, optional = true }
